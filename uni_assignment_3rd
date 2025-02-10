@@ -1,0 +1,91 @@
+
+import sys
+from pyspark import SparkConf, SparkContext
+from pyspark.sql.session import SparkSession
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import math
+
+class project3:
+    def run(self, inputpath, outputpath, d, s):
+        def euclidean_dist(id1, id2):
+            dist = math.sqrt((float(id1[0]) - float(id2[0]))**2 + (float(id1[1]) - float(id2[1]))**2)
+            return float(f"{dist:.6f}")
+
+
+        def prefix_filter(terms):
+            ss = float(tau_s.value)
+            p = len(terms) - math.ceil(len(terms) * ss) + 1 
+            return int(p) if p <= len(terms) else len(terms)
+
+        def jaccard_simliarity(list1, list2):
+            terms1 = set(list1)
+            terms2 = set(list2)
+            intersection = len(terms1 & terms2) 
+            union = len(terms1 | terms2) 
+            #return 1.0 * intersection / union
+            return float(f"{1.0 * intersection / union:.6f}")
+
+        def pairing_ids(thresholds):
+            paired_set_ids = set()
+            for x in thresholds:
+                xId, xLoc, xTerms = x[0], x[1], x[2]
+                for y in thresholds:
+                    yId, yLoc, yTerms = y[0], y[1], y[2]
+                    if int(xId) >= int(yId):
+                        continue
+                    sim = jaccard_simliarity(xTerms, yTerms)
+                    euc_dist = euclidean_dist(xLoc, yLoc)
+                    
+                    if (euc_dist <= tau_d.value) and (sim >= tau_s.value):
+                        paired_set_ids.add((xId, yId, float(euc_dist), float(sim)))
+            return paired_set_ids
+
+        conf = SparkConf()
+        sc = SparkContext(conf=conf)
+        tau_d = sc.broadcast(float(d))
+        tau_s = sc.broadcast(float(s))
+        file = sc.textFile(inputpath)
+        #(0, (0, 0), ['a', 'd', 'e', 'f']), (id-int, location-tuple, float, terms-list)
+        thresholds = file.map(lambda x: x.split("#")).map(
+                    lambda x: (int(x[0]), tuple(map(float, x[1].strip("()").split(","))), x[2].split()))
+
+        #sort by length of terms before prefix filtering--sort tokens by frequency
+        # ('term1', #of term1), ('term2', n), .. -> sortby #ofterms in asc (1 -> n)
+        # 1. compute token frequencies 
+        rdd_freq_sorted = thresholds.flatMap(lambda x: [(term, 1) for term in x[2]]) \
+            .reduceByKey(lambda a, b: a + b).sortBy(lambda x: x[1])
+        order_map = sc.broadcast(rdd_freq_sorted.collectAsMap())
+        sorted_records = thresholds.map(lambda x: (x[0], x[1], sorted(x[2], key=lambda y: order_map.value[y])))
+        # Stage 2: find 'similar' id pairs --prefix->partition
+        # output of the line below: id, *prefix length, (x,y), terms) : prefix filtering
+        prefix_length = sorted_records.map(lambda x: (x[0], (prefix_filter(x[2]), x[1], x[2])))
+        #term , [(id1 ~~), (id2 ~~) ..]
+        prefix_rdd = prefix_length.flatMap(
+            lambda x: [(one_term, (x[0], x[1][1], x[1][2])) for one_term in x[1][2][:x[1][0]]])
+        # Stage 3: group by and find pairs
+        # then jaccard similarities are calculated for each valid pair
+        # term , [(id1 ~~), (id2 ~~) ..] <- x[1] is the following list of the term
+        #group_prefix_rdd = prefix_rdd.groupByKey().map(lambda x: (x[0], list(x[1]))) \
+        #    .map(lambda x: pairing_ids(x[1])).flatMap(lambda x: x).distinct().sortBy(lambda x: (x[0], x[1]))
+        group_prefix_rdd = prefix_rdd.groupByKey().map(lambda x: (x[0], list(x[1]))) \
+            .map(lambda x: pairing_ids(x[1])).flatMap(lambda x: x).distinct().sortBy(lambda x: (x[0], x[1]))
+
+        def formatting(x):
+            dist = ('%.6f' % x[2]).rstrip('0').rstrip('.')
+            sim = ('%.6f' % x[3]).rstrip('0').rstrip('.')
+            dist = float(dist)
+            sim = float(sim) #for 1.0, not 1
+            return f"({x[0]},{x[1]}):{dist}, {sim}"
+
+        res = group_prefix_rdd.map(formatting)
+        res.coalesce(1).saveAsTextFile(outputpath)
+
+
+        res = group_prefix_rdd.map(formatting)
+        res.coalesce(1).saveAsTextFile(outputpath)
+if __name__ == '__main__':
+    if len(sys.argv) != 5:
+        print("Wrong arguments")
+        sys.exit(-1)
+    project3().run(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4])
